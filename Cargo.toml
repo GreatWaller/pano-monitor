@@ -1,0 +1,24 @@
+[package]
+name = "para-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI 框架 - eframe/egui
+eframe = "0.31"
+egui = "0.31"
+
+# GStreamer 绑定 (gst-rs)
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+
+# 日志
+log = "0.4"
+env_logger = "0.11"
+
+# 图像数据处理
+bytemuck = "1.16"
+
+[features]
+default = []
