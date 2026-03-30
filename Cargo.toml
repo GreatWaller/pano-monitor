@@ -20,5 +20,8 @@ env_logger = "0.11"
 # 图像数据处理
 bytemuck = "1.16"
 
+# 无锁并发数据结构
+crossbeam = "0.8"
+
 [features]
 default = []

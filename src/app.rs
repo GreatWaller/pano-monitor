@@ -7,6 +7,7 @@
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
+use crossbeam::queue::ArrayQueue;
 
 use crate::video_source::{VideoFrame, VideoSource, VideoSourceConfig, VideoSourceState};
 
@@ -14,6 +15,10 @@ use crate::video_source::{VideoFrame, VideoSource, VideoSourceConfig, VideoSourc
 pub struct RtspPlayerApp {
     /// 视频源管理器
     video_source: Arc<Mutex<VideoSource>>,
+    /// 无锁视频帧队列
+    frame_queue: Arc<ArrayQueue<VideoFrame>>,
+    /// 无锁状态队列
+    state_queue: Arc<ArrayQueue<VideoSourceState>>,
     /// RTSP 地址输入框内容
     rtsp_url: String,
     /// 是否正在连接/已连接
@@ -26,6 +31,10 @@ pub struct RtspPlayerApp {
     frame_count: u64,
     /// 最后一帧的尺寸
     last_frame_size: Option<(u32, u32)>,
+    /// 缓存的视频纹理
+    texture: Option<egui::TextureHandle>,
+    /// 当前状态（从队列中读取的最新状态）
+    current_state: VideoSourceState,
 }
 
 impl RtspPlayerApp {
@@ -34,14 +43,24 @@ impl RtspPlayerApp {
         // 配置 egui 样式
         Self::configure_egui(cc);
 
+        // 创建视频源，队列容量为 3 帧
+        let video_source = VideoSource::new(3);
+        // 获取队列的 Arc 引用，供 UI 直接访问（无锁）
+        let frame_queue = video_source.get_frame_queue();
+        let state_queue = video_source.get_state_queue();
+
         Self {
-            video_source: Arc::new(Mutex::new(VideoSource::new())),
+            video_source: Arc::new(Mutex::new(video_source)),
+            frame_queue,
+            state_queue,
             rtsp_url: String::new(),
             is_connected: false,
             status_text: String::from("未连接"),
             use_hw_decoder: false,
             frame_count: 0,
             last_frame_size: None,
+            texture: None,
+            current_state: VideoSourceState::Disconnected,
         }
     }
 
@@ -134,19 +153,28 @@ impl RtspPlayerApp {
     fn disconnect(&mut self) {
         let mut vs = self.video_source.lock().unwrap();
         vs.disconnect();
-        
+
         self.is_connected = false;
         self.status_text = String::from("已断开");
         self.frame_count = 0;
         self.last_frame_size = None;
+        self.texture = None;
+        self.current_state = VideoSourceState::Disconnected;
+        
+        // 清空队列
+        while self.frame_queue.pop().is_some() {}
+        while self.state_queue.pop().is_some() {}
     }
 
     /// 从视频源获取最新帧并转换为 egui 图像
-    fn get_frame_as_color_image(&self) -> Option<egui::ColorImage> {
-        let vs = self.video_source.lock().unwrap();
-
-        vs.get_latest_frame().map(|frame| {
-            Self::convert_rgbx_to_color_image(frame)
+    /// 返回 (ColorImage, 尺寸) 以便更新 last_frame_size
+    fn get_frame_as_color_image(&mut self) -> Option<(egui::ColorImage, (u32, u32))> {
+        // 从队列中获取最新帧（无锁操作）
+        // 注意：这里我们只取一帧，如果需要获取多帧可以循环 pop
+        self.frame_queue.pop().map(|frame| {
+            let size = (frame.width, frame.height);
+            let color_image = Self::convert_rgbx_to_color_image(frame);
+            (color_image, size)
         })
     }
 
@@ -179,10 +207,12 @@ impl RtspPlayerApp {
 
     /// 更新状态文本
     fn update_status(&mut self) {
-        let vs = self.video_source.lock().unwrap();
-        let state = vs.get_state();
+        // 从状态队列中读取最新状态（无锁操作）
+        while let Some(state) = self.state_queue.pop() {
+            self.current_state = state;
+        }
 
-        self.status_text = match state {
+        self.status_text = match self.current_state {
             VideoSourceState::Disconnected => String::from("未连接"),
             VideoSourceState::Connecting => String::from("正在连接..."),
             VideoSourceState::Playing => format!("播放中 | 帧数：{}", self.frame_count),
@@ -190,7 +220,7 @@ impl RtspPlayerApp {
         };
 
         // 更新内部连接状态
-        if matches!(state, VideoSourceState::Playing) && !self.is_connected {
+        if matches!(self.current_state, VideoSourceState::Playing) && !self.is_connected {
             self.is_connected = true;
         }
     }
@@ -236,10 +266,12 @@ impl eframe::App for RtspPlayerApp {
         // 中央面板：视频显示区域
         egui::CentralPanel::default().show(ctx, |ui| {
             // 尝试获取最新帧
-            if let Some(color_image) = self.get_frame_as_color_image() {
+            if let Some((color_image, frame_size)) = self.get_frame_as_color_image() {
+                // 更新最后一帧的尺寸
+                self.last_frame_size = Some(frame_size);
+
                 // 计算保持宽高比的显示尺寸
                 let available_size = ui.available_size();
-                let frame_size = self.last_frame_size.unwrap_or((1, 1));
 
                 let display_size = Self::calculate_display_size(
                     frame_size.0 as f32,
@@ -247,17 +279,27 @@ impl eframe::App for RtspPlayerApp {
                     available_size,
                 );
 
-                // 显示图像 - 使用 TextureHandle
-                let texture_handle = ui.ctx().load_texture(
-                    "video_frame",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                );
-                ui.add(
-                    egui::Image::new(&texture_handle)
-                        .fit_to_exact_size(display_size)
-                        .maintain_aspect_ratio(true),
-                );
+                // 使用 TextureHandle 缓存纹理，避免每帧创建新纹理
+                if let Some(texture) = &mut self.texture {
+                    // 纹理已存在，更新内容
+                    texture.set(color_image, egui::TextureOptions::LINEAR);
+                } else {
+                    // 首次创建纹理
+                    self.texture = Some(ui.ctx().load_texture(
+                        "video_frame",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+
+                // 显示图像
+                if let Some(texture) = &self.texture {
+                    ui.add(
+                        egui::Image::new(texture)
+                            .fit_to_exact_size(display_size)
+                            .maintain_aspect_ratio(true),
+                    );
+                }
             } else {
                 // 无视频时显示占位符
                 ui.centered_and_justified(|ui| {

@@ -12,8 +12,9 @@ use gstreamer_app as gst_app;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
+use crossbeam::queue::ArrayQueue;
 
 /// 视频帧数据，包含 RGB 像素和尺寸信息
 #[derive(Clone, Debug)]
@@ -49,54 +50,61 @@ pub struct VideoSourceConfig {
 }
 
 /// 视频源管理器
-/// 
+///
 /// 负责管理 GStreamer 管道生命周期和帧数据提取
 pub struct VideoSource {
     /// GStreamer 管道元素
     pipeline: Option<gst::Pipeline>,
-    /// 共享的视频帧数据，GUI 线程从中读取
-    /// 使用 Arc<Mutex<>> 实现零拷贝的帧共享
-    latest_frame: Arc<Mutex<Option<VideoFrame>>>,
+    /// 无锁视频帧队列，保存最新的 N 帧
+    /// GUI 线程从中读取，GStreamer 线程写入
+    frame_queue: Arc<ArrayQueue<VideoFrame>>,
     /// 运行状态标志
     is_running: Arc<AtomicBool>,
     /// 当前状态
-    state: Arc<Mutex<VideoSourceState>>,
+    state: Arc<ArrayQueue<VideoSourceState>>,
 }
 
 impl VideoSource {
     /// 创建新的视频源实例
-    pub fn new() -> Self {
+    /// 
+    /// # 参数
+    /// * `queue_capacity` - 帧队列容量，保存最新的 N 帧
+    pub fn new(queue_capacity: usize) -> Self {
         Self {
             pipeline: None,
-            latest_frame: Arc::new(Mutex::new(None)),
+            frame_queue: Arc::new(ArrayQueue::new(queue_capacity)),
             is_running: Arc::new(AtomicBool::new(false)),
-            state: Arc::new(Mutex::new(VideoSourceState::Disconnected)),
+            state: Arc::new(ArrayQueue::new(10)),
         }
     }
 
     /// 初始化 GStreamer 库
-    /// 
-    /// 必须在创建任何 GStreamer 对象前调用
+    ///
+    /// 必须在创建任何 GStreamer 对象之前调用
     pub fn init() -> Result<(), gst::glib::Error> {
         gst::init()
     }
 
-    /// 获取当前视频帧的克隆
-    /// 
-    /// GUI 线程调用此方法获取最新帧进行渲染
-    pub fn get_latest_frame(&self) -> Option<VideoFrame> {
-        self.latest_frame.lock().ok().and_then(|opt| opt.clone())
+    /// 获取帧队列的 Arc 引用
+    ///
+    /// 允许外部直接访问帧队列，避免额外的锁开销
+    pub fn get_frame_queue(&self) -> Arc<ArrayQueue<VideoFrame>> {
+        Arc::clone(&self.frame_queue)
     }
 
-    /// 获取当前连接状态
-    pub fn get_state(&self) -> VideoSourceState {
-        self.state.lock().unwrap().clone()
+    /// 获取状态队列的 Arc 引用
+    ///
+    /// 允许外部直接访问状态队列，避免额外的锁开销
+    pub fn get_state_queue(&self) -> Arc<ArrayQueue<VideoSourceState>> {
+        Arc::clone(&self.state)
     }
 
     /// 设置状态（内部使用）
     fn set_state(&self, state: VideoSourceState) {
-        if let Ok(mut guard) = self.state.lock() {
-            *guard = state;
+        // 尝试推入新状态，如果队列满了先弹出旧状态
+        if self.state.push(state.clone()).is_err() {
+            let _ = self.state.pop();
+            let _ = self.state.push(state);
         }
     }
 
@@ -123,7 +131,7 @@ impl VideoSource {
         };
 
         // 设置管道为播放状态
-        pipeline.set_state(gst::State::Playing);
+        let _ = pipeline.set_state(gst::State::Playing);
 
         // 处理总线消息（错误、EOS 等）
         self.setup_bus_watch(&pipeline);
@@ -138,20 +146,16 @@ impl VideoSource {
 
         if let Some(pipeline) = self.pipeline.take() {
             // 先设置为 Null 状态，停止所有数据处理
-            pipeline.set_state(gst::State::Null);
+            let _ = pipeline.set_state(gst::State::Null);
         }
 
-        // 清空帧数据
-        if let Ok(mut frame) = self.latest_frame.lock() {
-            *frame = None;
-        }
+        // 清空帧队列
+        while self.frame_queue.pop().is_some() {}
+        
+        // 清空状态队列
+        while self.state.pop().is_some() {}
 
         self.set_state(VideoSourceState::Disconnected);
-    }
-
-    /// 检查是否正在运行
-    pub fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::SeqCst)
     }
 
     /// 构建 GStreamer 管道
@@ -174,7 +178,7 @@ impl VideoSource {
             .property("location", &config.rtsp_url)
             .property("is-live", true)           // 标记为直播流，启用适当的缓冲策略
             .property("tcp-timeout", 5000u64)    // TCP 超时时间（毫秒）
-            .property("latency", 0u32)           // 延迟设置为 0，追求最低延迟
+            .property("latency", 100u32)         // 延迟设置为 100ms，平衡低延迟与稳定性
             .build()
             .map_err(|e| format!("无法创建 rtspsrc 元素：{:?}", e))?;
 
@@ -291,7 +295,8 @@ impl VideoSource {
         .map_err(|e| format!("链接静态元素失败：{:?}", e))?;
 
         // 克隆共享数据引用供回调使用
-        let frame_clone = Arc::clone(&self.latest_frame);
+        let frame_queue = Arc::clone(&self.frame_queue);
+        let state_queue = Arc::clone(&self.state);
         let running_clone = Arc::clone(&self.is_running);
 
         // 连接 appsink 的 new-sample 信号
@@ -334,10 +339,15 @@ impl VideoSource {
                             height: height as u32,
                         };
 
-                        // 更新共享帧（非阻塞操作）
-                        if let Ok(mut latest) = frame_clone.lock() {
-                            *latest = Some(frame);
+                        // 将帧推入队列（如果队列满了会丢弃最旧的帧）
+                        if frame_queue.push(frame.clone()).is_err() {
+                            // 队列已满，弹出一帧后再推入
+                            let _ = frame_queue.pop();
+                            let _ = frame_queue.push(frame);
                         }
+
+                        // 推入 Playing 状态
+                        let _ = state_queue.push(VideoSourceState::Playing);
                     }
 
                     Some(gst::FlowReturn::Ok.to_value())
@@ -360,8 +370,8 @@ impl VideoSource {
                 return;
             }
 
-            // 使用 gst_pad_link_full 并跳过兼容性检查，让 GStreamer 在运行时协商
-            let link_result = src_pad.link_full(&depay_sink_pad, gst::PadLinkCheck::empty());
+            // 使用 gst_pad_link_full 并进行 DEFAULT 检查，确保兼容性
+            let link_result = src_pad.link_full(&depay_sink_pad, gst::PadLinkCheck::DEFAULT);
             match link_result {
                 Ok(_) => {
                     log::info!("成功链接 rtspsrc 到 depay");
@@ -380,7 +390,7 @@ impl VideoSource {
     /// 监听错误、警告、EOS 等消息
     fn setup_bus_watch(&mut self, pipeline: &gst::Pipeline) {
         let bus = pipeline.bus().unwrap();
-        let state_clone = Arc::clone(&self.state);
+        let state_queue = Arc::clone(&self.state);
         let is_running_clone = Arc::clone(&self.is_running);
 
         let _watch = bus.add_watch(move |_bus, msg| {
@@ -391,12 +401,10 @@ impl VideoSource {
                         err.src().map(|s| s.path_string()),
                         err.error()
                     );
-                    if let Ok(mut state) = state_clone.lock() {
-                        *state = VideoSourceState::Error(format!(
-                            "错误：{}",
-                            err.error()
-                        ));
-                    }
+                    let _ = state_queue.push(VideoSourceState::Error(format!(
+                        "错误：{}",
+                        err.error()
+                    )));
                 }
                 gst::MessageView::Warning(warn) => {
                     log::warn!(
@@ -408,9 +416,7 @@ impl VideoSource {
                 gst::MessageView::Eos(..) => {
                     log::info!("GStreamer 流结束 (EOS)");
                     if is_running_clone.load(Ordering::SeqCst) {
-                        if let Ok(mut state) = state_clone.lock() {
-                            *state = VideoSourceState::Disconnected;
-                        }
+                        let _ = state_queue.push(VideoSourceState::Disconnected);
                     }
                 }
                 gst::MessageView::StateChanged(state_changed) => {
@@ -429,7 +435,7 @@ impl VideoSource {
 
 impl Default for VideoSource {
     fn default() -> Self {
-        Self::new()
+        Self::new(3)
     }
 }
 
