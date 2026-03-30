@@ -101,10 +101,10 @@ impl VideoSource {
     }
 
     /// 连接到 RTSP 流
-    /// 
+    ///
     /// # 参数
     /// * `config` - 视频源配置，包含 RTSP URL 和解码器偏好
-    /// 
+    ///
     /// # 返回
     /// 成功时返回 Ok，失败时返回错误信息
     pub fn connect(&mut self, config: &VideoSourceConfig) -> Result<(), String> {
@@ -113,8 +113,15 @@ impl VideoSource {
         self.is_running.store(true, Ordering::SeqCst);
 
         // 构建 GStreamer 管道
-        let pipeline = self.build_pipeline(config)?;
-        
+        let pipeline = match self.build_pipeline(config) {
+            Ok(p) => p,
+            Err(e) => {
+                self.is_running.store(false, Ordering::SeqCst);
+                self.set_state(VideoSourceState::Error(e.clone()));
+                return Err(e);
+            }
+        };
+
         // 设置管道为播放状态
         pipeline.set_state(gst::State::Playing);
 
@@ -166,7 +173,7 @@ impl VideoSource {
         let src = gst::ElementFactory::make("rtspsrc")
             .property("location", &config.rtsp_url)
             .property("is-live", true)           // 标记为直播流，启用适当的缓冲策略
-            .property("tcp-timeout", 5000u32)    // TCP 超时时间（毫秒）
+            .property("tcp-timeout", 5000u64)    // TCP 超时时间（毫秒）
             .property("latency", 0u32)           // 延迟设置为 0，追求最低延迟
             .build()
             .map_err(|e| format!("无法创建 rtspsrc 元素：{:?}", e))?;
@@ -181,17 +188,51 @@ impl VideoSource {
         // 根据配置选择硬件或软件解码器
         let decoder = if config.use_hw_decoder {
             // 尝试使用硬件解码器（NVIDIA/Intel/Apple）
-            gst::ElementFactory::make("nvh264dec")
-                .build()
-                .or_else(|_| gst::ElementFactory::make("vaapih264dec").build())
-                .or_else(|_| gst::ElementFactory::make("vtdec_h264").build())
-                .unwrap_or_else(|_| {
-                    // 硬件解码器不可用时回退到软件解码
-                    log::warn!("硬件解码器不可用，回退到软件解码");
-                    gst::ElementFactory::make("avdec_h264")
-                        .build()
-                        .expect("avdec_h264 应该始终可用")
-                })
+            log::info!("尝试使用硬件解码器...");
+            
+            // Windows: 尝试 D3D11 或 Intel QuickSync
+            #[cfg(target_os = "windows")]
+            {
+                gst::ElementFactory::make("d3d11h264dec")
+                    .build()
+                    .or_else(|_| gst::ElementFactory::make("msdkh264dec").build())
+                    .or_else(|_| gst::ElementFactory::make("nvh264dec").build())
+                    .or_else(|_| gst::ElementFactory::make("vaapih264dec").build())
+                    .unwrap_or_else(|_| {
+                        // 硬件解码器不可用时回退到软件解码
+                        log::warn!("硬件解码器不可用，回退到软件解码");
+                        gst::ElementFactory::make("avdec_h264")
+                            .build()
+                            .expect("avdec_h264 应该始终可用")
+                    })
+            }
+            
+            // macOS: 使用 VideoToolbox
+            #[cfg(target_os = "macos")]
+            {
+                gst::ElementFactory::make("vtdec_h264")
+                    .build()
+                    .unwrap_or_else(|_| {
+                        log::warn!("vtdec_h264 不可用，回退到软件解码");
+                        gst::ElementFactory::make("avdec_h264")
+                            .build()
+                            .expect("avdec_h264 应该始终可用")
+                    })
+            }
+            
+            // Linux: 使用 VAAPI 或 NVIDIA
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                gst::ElementFactory::make("nvh264dec")
+                    .build()
+                    .or_else(|_| gst::ElementFactory::make("vaapih264dec").build())
+                    .unwrap_or_else(|_| {
+                        log::warn!("硬件解码器不可用，回退到软件解码");
+                        gst::ElementFactory::make("avdec_h264")
+                            .build()
+                            .expect("avdec_h264 应该始终可用")
+                    })
+            }
         } else {
             // avdec_h264: FFmpeg H264 软件解码器
             gst::ElementFactory::make("avdec_h264")
@@ -207,11 +248,12 @@ impl VideoSource {
 
         // === 创建视频格式过滤器 ===
         // 强制输出为 RGB 格式，供 egui 使用
+        // 使用 RGBx 格式以提高兼容性
         let capsfilter = gst::ElementFactory::make("capsfilter")
             .property(
                 "caps",
                 gst::Caps::builder("video/x-raw")
-                    .field("format", "RGB")
+                    .field("format", "RGBx")
                     .build(),
             )
             .build()
@@ -309,17 +351,24 @@ impl VideoSource {
         let depay_sink_pad = depay
             .static_pad("sink")
             .ok_or("rtph264depay 没有 sink pad")?;
-        
+
+        // 使用 pad_added 信号处理动态链接
         src.connect_pad_added(move |_src, src_pad| {
             // 检查 pad 是否已链接
             if depay_sink_pad.is_linked() {
                 log::warn!("depay sink pad 已链接，跳过");
                 return;
             }
-            
-            // 链接 rtspsrc 的输出 pad 到 depay 的输入 pad
-            if let Err(e) = src_pad.link(&depay_sink_pad) {
-                log::error!("链接 rtspsrc 到 depay 失败：{:?}", e);
+
+            // 使用 gst_pad_link_full 并跳过兼容性检查，让 GStreamer 在运行时协商
+            let link_result = src_pad.link_full(&depay_sink_pad, gst::PadLinkCheck::empty());
+            match link_result {
+                Ok(_) => {
+                    log::info!("成功链接 rtspsrc 到 depay");
+                }
+                Err(e) => {
+                    log::error!("链接 rtspsrc 到 depay 失败：{:?}", e);
+                }
             }
         });
 

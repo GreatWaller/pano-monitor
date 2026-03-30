@@ -53,10 +53,9 @@ impl RtspPlayerApp {
         // 配置字体以支持中文显示
         let mut fonts = egui::FontDefinitions::default();
 
-        // 使用 macOS 系统自带的日文字体（支持中文）
         use egui::FontFamily;
-        
-        // 加载系统字体 Hiragino Sans GB
+
+        // macOS: 使用 Hiragino Sans GB
         #[cfg(target_os = "macos")]
         fonts.font_data.insert(
             "hiragino".to_owned(),
@@ -65,13 +64,28 @@ impl RtspPlayerApp {
             )),
         );
 
-        // 将自定义字体添加到默认字体列表的开头
         #[cfg(target_os = "macos")]
         fonts
             .families
             .get_mut(&FontFamily::Proportional)
             .unwrap()
             .insert(0, "hiragino".to_owned());
+
+        // Windows: 使用微软雅黑 (Microsoft YaHei)
+        #[cfg(target_os = "windows")]
+        fonts.font_data.insert(
+            "msyh".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_static(
+                include_bytes!("C:/Windows/Fonts/msyh.ttc")
+            )),
+        );
+
+        #[cfg(target_os = "windows")]
+        fonts
+            .families
+            .get_mut(&FontFamily::Proportional)
+            .unwrap()
+            .insert(0, "msyh".to_owned());
 
         cc.egui_ctx.set_fonts(fonts);
     }
@@ -88,6 +102,8 @@ impl RtspPlayerApp {
 
         // 克隆 Arc 以便在闭包中使用
         let video_source = Arc::clone(&self.video_source);
+        let status_text = Arc::new(Mutex::new(self.status_text.clone()));
+        let status_text_clone = Arc::clone(&status_text);
 
         // 在后台线程中执行连接操作（避免阻塞 UI）
         std::thread::spawn(move || {
@@ -103,6 +119,9 @@ impl RtspPlayerApp {
                 }
                 Err(e) => {
                     log::error!("连接失败：{}", e);
+                    if let Ok(mut status) = status_text_clone.lock() {
+                        *status = format!("错误：{}", e);
+                    }
                 }
             }
         });
@@ -127,27 +146,28 @@ impl RtspPlayerApp {
         let vs = self.video_source.lock().unwrap();
 
         vs.get_latest_frame().map(|frame| {
-            Self::convert_rgb_to_color_image(frame)
+            Self::convert_rgbx_to_color_image(frame)
         })
     }
 
-    /// 将 RGB 视频帧转换为 egui::ColorImage
-    /// 
+    /// 将 RGBx 视频帧转换为 egui::ColorImage
+    ///
+    /// RGBx 格式：每像素 4 字节 [R,G,B,x, R,G,B,x, ...]，x 是未使用的填充字节
     /// egui 使用 [r, g, b, a] 格式的预乘 alpha 颜色空间
-    fn convert_rgb_to_color_image(frame: VideoFrame) -> egui::ColorImage {
+    fn convert_rgbx_to_color_image(frame: VideoFrame) -> egui::ColorImage {
         let width = frame.width as usize;
         let height = frame.height as usize;
-        
+
         // 分配图像数据缓冲区
-        // egui 使用预乘 alpha 的 RGBA 格式
         let mut pixels = vec![egui::Color32::BLACK; width * height];
 
-        // 将 RGB 数据转换为 egui 格式
-        // RGB 数据按行优先存储：[R,G,B, R,G,B, ...]
-        for (y, row) in frame.data.chunks_exact(width * 3).enumerate() {
-            for (x, rgb) in row.chunks_exact(3).enumerate() {
+        // 将 RGBx 数据转换为 egui 格式
+        // RGBx 数据按行优先存储：[R,G,B,x, R,G,B,x, ...]
+        for (y, row) in frame.data.chunks_exact(width * 4).enumerate() {
+            for (x, rgbx) in row.chunks_exact(4).enumerate() {
                 let idx = y * width + x;
-                pixels[idx] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                // RGBx 中 x 是填充字节，忽略它
+                pixels[idx] = egui::Color32::from_rgb(rgbx[0], rgbx[1], rgbx[2]);
             }
         }
 
@@ -188,7 +208,7 @@ impl eframe::App for RtspPlayerApp {
                 // RTSP 地址输入框
                 ui.label("RTSP 地址:");
                 let text_edit = egui::TextEdit::singleline(&mut self.rtsp_url)
-                    .hint_text("rtsp://192.168.1.100:554/stream")
+                    .hint_text("rtsp://192.168.1.220/CEN-Profile_101")
                     .desired_width(300.0);
                 ui.add(text_edit);
 
