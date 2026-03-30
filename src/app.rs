@@ -44,7 +44,7 @@ impl RtspPlayerApp {
         Self::configure_egui(cc);
 
         // 创建视频源，队列容量为 3 帧
-        let video_source = VideoSource::new(3);
+        let video_source = VideoSource::new(100);
         // 获取队列的 Arc 引用，供 UI 直接访问（无锁）
         let frame_queue = video_source.get_frame_queue();
         let state_queue = video_source.get_state_queue();

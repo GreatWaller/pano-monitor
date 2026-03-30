@@ -346,6 +346,9 @@ impl VideoSource {
                             let _ = frame_queue.push(frame);
                         }
 
+                        // 打印队列实时长度（调试用）
+                        log::debug!("帧队列长度：{}", frame_queue.len());
+
                         // 推入 Playing 状态
                         let _ = state_queue.push(VideoSourceState::Playing);
                     }
